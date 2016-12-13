@@ -43,7 +43,7 @@ from tensorflow.python.framework import tensor_shape
 from tensorflow.python.framework import versions
 from tensorflow.python.platform import tf_logging as logging
 from tensorflow.python.util import compat
-from tensorflow.python.util import deprecation
+from tensorflow.python.util import decorator_utils
 
 
 def _override_helper(clazz_object, operator, func):
@@ -1905,6 +1905,18 @@ def get_stats_for_node_def(graph, node, statistic_type):
   return result
 
 
+def _name_from_scope_name(name):
+  """Returns the name of an op given the name of its scope.
+
+  Args:
+    name: the name of the scope.
+
+  Returns:
+    the name of the op (equal to scope name minus any trailing slash).
+  """
+  return name[:-1] if name[-1] == "/" else name
+
+
 class Graph(object):
   """A TensorFlow computation, represented as a dataflow graph.
 
@@ -2336,7 +2348,7 @@ class Graph(object):
     # If a names ends with a '/' it is a "name scope" and we use it as-is,
     # after removing the trailing '/'.
     if name and name[-1] == "/":
-      name = name[:-1]
+      name = _name_from_scope_name(name)
     else:
       name = self.unique_name(name)
 
@@ -2887,7 +2899,7 @@ class Graph(object):
       if not name:  # Both for name=None and name="" we re-set to empty scope.
         new_stack = None
       elif name and name[-1] == "/":
-        new_stack = name[:-1]
+        new_stack = _name_from_scope_name(name)
       else:
         new_stack = self.unique_name(name)
       self._name_stack = new_stack
@@ -3980,7 +3992,7 @@ class GraphKeys(object):
     for more details.
   * `SUMMARIES`: the summary `Tensor` objects that have been created in the
     graph. See
-    [`tf.merge_all_summaries()`](../../api_docs/python/train.md#merge_all_summaries)
+    [`tf.summary.merge_all()`](../../api_docs/python/summary.md#merge_all)
     for more details.
   * `QUEUE_RUNNERS`: the `QueueRunner` objects that are used to
     produce input for a computation. See
@@ -4063,12 +4075,12 @@ class GraphKeys(object):
   COND_CONTEXT = "cond_context"
   WHILE_CONTEXT = "while_context"
 
-  @property
-  @deprecation.deprecated("2017-03-02",
-              "VARIABLES collection name is deprecated, "
-              "please use GLOBAL_VARIABLES instead")
-  def VARIABLES(self):
-    return self.GLOBAL_VARIABLES
+  @decorator_utils.classproperty
+  def VARIABLES(cls):  # pylint: disable=no-self-argument
+    logging.warning("VARIABLES collection name is deprecated, "
+                    "please use GLOBAL_VARIABLES instead; "
+                    "VARIABLES will be removed after 2017-03-02.")
+    return cls.GLOBAL_VARIABLES
 
 
 def add_to_collection(name, value):

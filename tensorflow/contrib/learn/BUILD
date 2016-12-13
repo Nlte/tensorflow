@@ -9,18 +9,23 @@ package(default_visibility = ["//tensorflow:__subpackages__"])
 
 py_library(
     name = "learn",
-    srcs = glob([
-        "python/learn/**/*.py",
-    ]) + [
+    srcs = [
         "__init__.py",
         "python/__init__.py",
-    ],
+    ] + glob(
+        ["python/learn/**/*.py"],
+        exclude = ["python/learn/**/*_test.py"],
+    ),
     srcs_version = "PY2AND3",
     deps = [
         "//tensorflow/contrib/learn/python/learn/datasets",
         "//tensorflow/contrib/session_bundle:exporter",
         "//tensorflow/contrib/tensor_forest:client_lib",
         "//tensorflow/python:framework",
+        "//tensorflow/python/saved_model:builder",
+        "//tensorflow/python/saved_model:loader",
+        "//tensorflow/python/saved_model:signature_def_utils",
+        "//tensorflow/python/saved_model:tag_constants",
     ],
 )
 
@@ -397,7 +402,7 @@ py_test(
 
 py_test(
     name = "head_test",
-    size = "small",
+    size = "medium",
     srcs = ["python/learn/estimators/head_test.py"],
     srcs_version = "PY2AND3",
     deps = [
@@ -433,6 +438,18 @@ py_test(
         "//learning/brain/google/guitar:__subpackages__",
         "//tensorflow:__subpackages__",
     ],
+    deps = [
+        ":learn",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:framework_test_lib",
+    ],
+)
+
+py_test(
+    name = "kmeans_test",
+    size = "medium",
+    srcs = ["python/learn/estimators/kmeans_test.py"],
+    srcs_version = "PY2AND3",
     deps = [
         ":learn",
         "//tensorflow:tensorflow_py",
@@ -635,6 +652,18 @@ py_test(
 )
 
 py_test(
+    name = "numpy_io_test",
+    size = "small",
+    srcs = ["python/learn/learn_io/numpy_io_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":learn",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:framework_test_lib",
+    ],
+)
+
+py_test(
     name = "pandas_io_test",
     size = "small",
     srcs = ["python/learn/learn_io/pandas_io_test.py"],
@@ -654,6 +683,32 @@ py_test(
     tags = [
         "manual",  # http://b/31032996
     ],
+    deps = [
+        ":learn",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:framework_test_lib",
+    ],
+)
+
+py_test(
+    name = "gc_test",
+    size = "small",
+    srcs = ["python/learn/utils/gc_test.py"],
+    srcs_version = "PY2AND3",
+    deps = [
+        ":learn",
+        "//tensorflow:tensorflow_py",
+        "//tensorflow/python:framework",
+        "//tensorflow/python:framework_test_lib",
+    ],
+)
+
+py_test(
+    name = "saved_model_export_utils_test",
+    size = "small",
+    srcs = ["python/learn/utils/saved_model_export_utils_test.py"],
+    srcs_version = "PY2AND3",
     deps = [
         ":learn",
         "//tensorflow:tensorflow_py",

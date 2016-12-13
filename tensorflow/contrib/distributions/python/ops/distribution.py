@@ -130,7 +130,10 @@ class _DistributionMeta(abc.ABCMeta):
     if not baseclasses:  # Nothing to be done for Distribution
       raise TypeError("Expected non-empty baseclass.  Does Distribution "
                       "not subclass _BaseDistribution?")
-    base = baseclasses[0]
+    which_base = [
+        base for base in baseclasses
+        if base == _BaseDistribution or issubclass(base, Distribution)]
+    base = which_base[0]
     if base == _BaseDistribution:  # Nothing to be done for Distribution
       return abc.ABCMeta.__new__(mcs, classname, baseclasses, attrs)
     if not issubclass(base, Distribution):
@@ -541,8 +544,9 @@ class Distribution(_BaseDistribution):
         return self.sample_n(sample_shape, seed, **condition_kwargs)
       sample_shape, total = self._expand_sample_shape(sample_shape)
       samples = self.sample_n(total, seed, **condition_kwargs)
-      output_shape = array_ops.concat(0, [sample_shape, array_ops.slice(
-          array_ops.shape(samples), [1], [-1])])
+      output_shape = array_ops.concat_v2(
+          [sample_shape, array_ops.slice(array_ops.shape(samples), [1], [-1])],
+          0)
       output = array_ops.reshape(samples, output_shape)
       output.set_shape(tensor_util.constant_value_as_shape(
           sample_shape).concatenate(samples.get_shape()[1:]))

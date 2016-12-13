@@ -182,7 +182,7 @@ class StudentT(distribution.Distribution):
   def _sample_n(self, n, seed=None):
     # The sampling method comes from the well known fact that if X ~ Normal(0,
     # 1), and Z ~ Chi2(df), then X / sqrt(Z / df) ~ StudentT(df).
-    shape = array_ops.concat(0, ([n], self.batch_shape()))
+    shape = array_ops.concat_v2(([n], self.batch_shape()), 0)
     normal_sample = random_ops.random_normal(
         shape, dtype=self.dtype, seed=seed)
     half = constant_op.constant(0.5, self.dtype)
@@ -214,7 +214,7 @@ class StudentT(distribution.Distribution):
   def _entropy(self):
     u = array_ops.expand_dims(self.df * self._ones(), -1)
     v = array_ops.expand_dims(self._ones(), -1)
-    beta_arg = array_ops.concat(len(u.get_shape()) - 1, [u, v]) / 2
+    beta_arg = array_ops.concat_v2([u, v], len(u.get_shape()) - 1) / 2
     half_df = 0.5 * self.df
     return ((0.5 + half_df) * (math_ops.digamma(0.5 + half_df) -
                                math_ops.digamma(half_df)) +
@@ -230,7 +230,7 @@ class StudentT(distribution.Distribution):
     mean = self.mu * self._ones()
     if self.allow_nan_stats:
       nan = np.array(np.nan, dtype=self.dtype.as_numpy_dtype())
-      return math_ops.select(
+      return array_ops.where(
           math_ops.greater(self.df, self._ones()), mean,
           array_ops.fill(self.batch_shape(), nan, name="nan"))
     else:
@@ -255,14 +255,14 @@ class StudentT(distribution.Distribution):
            math_ops.square(self.sigma) * self.df / (self.df - 2))
     # When 1 < df <= 2, variance is infinite.
     inf = np.array(np.inf, dtype=self.dtype.as_numpy_dtype())
-    result_where_defined = math_ops.select(
+    result_where_defined = array_ops.where(
         math_ops.greater(self.df, array_ops.fill(self.batch_shape(), 2.)),
         var,
         array_ops.fill(self.batch_shape(), inf, name="inf"))
 
     if self.allow_nan_stats:
       nan = np.array(np.nan, dtype=self.dtype.as_numpy_dtype())
-      return math_ops.select(
+      return array_ops.where(
           math_ops.greater(self.df, self._ones()),
           result_where_defined,
           array_ops.fill(self.batch_shape(), nan, name="nan"))

@@ -78,7 +78,10 @@ can have speed penalty, specially in distributed settings.
     `batch_size`. The normalization is over all but the last dimension if
     `data_format` is `NHWC` and the second dimension if `data_format` is
     `NCHW`.
-*  <b>`decay`</b>: decay for the moving average.
+*  <b>`decay`</b>: decay for the moving average. Reasonable values for `decay` are close
+    to 1.0, typically in the multiple-nines range: 0.999, 0.99, 0.9, etc. Lower
+    `decay` value (recommend trying `decay`=0.9) if model experiences reasonably
+    good training performance but poor validation and/or test performance.
 *  <b>`center`</b>: If True, subtract `beta`. If False, `beta` is ignored.
 *  <b>`scale`</b>: If True, multiply by `gamma`. If False, `gamma` is
     not used. When the next layer is linear (also e.g. `nn.relu`), this can be
@@ -332,7 +335,7 @@ Flattens the input while maintaining the batch_size.
 ##### Raises:
 
 
-*  <b>`ValueError`</b>: if inputs.shape is wrong.
+*  <b>`ValueError`</b>: if inputs.dense_shape is wrong.
 
 
 - - -
@@ -606,6 +609,9 @@ to produce the end result.
 *  <b>`stride`</b>: a list of length 2: [stride_height, stride_width], specifying the
     depthwise convolution stride. Can be an int if both strides are the same.
 *  <b>`padding`</b>: one of 'VALID' or 'SAME'.
+*  <b>`rate`</b>: a list of length 2: [rate_height, rate_width], specifying the dilation
+    rates for a'trous convolution. Can be an int if both rates are the same.
+    If any value is larger than one, then both stride values need to be one.
 *  <b>`activation_fn`</b>: activation function, set to None to skip it and maintain
     a linear activation.
 *  <b>`normalizer_fn`</b>: normalization function to use instead of `biases`. If
@@ -628,53 +634,6 @@ to produce the end result.
 ##### Returns:
 
   A `Tensor` representing the output of the operation.
-
-
-- - -
-
-### `tf.stack(values, axis=0, name='stack')` {#stack}
-
-Stacks a list of rank-`R` tensors into one rank-`(R+1)` tensor.
-
-Packs the list of tensors in `values` into a tensor with rank one higher than
-each tensor in `values`, by packing them along the `axis` dimension.
-Given a list of length `N` of tensors of shape `(A, B, C)`;
-
-if `axis == 0` then the `output` tensor will have the shape `(N, A, B, C)`.
-if `axis == 1` then the `output` tensor will have the shape `(A, N, B, C)`.
-Etc.
-
-For example:
-
-```prettyprint
-# 'x' is [1, 4]
-# 'y' is [2, 5]
-# 'z' is [3, 6]
-stack([x, y, z]) => [[1, 4], [2, 5], [3, 6]]  # Pack along first dim.
-stack([x, y, z], axis=1) => [[1, 2, 3], [4, 5, 6]]
-```
-
-This is the opposite of unstack.  The numpy equivalent is
-
-    tf.stack([x, y, z]) = np.asarray([x, y, z])
-
-##### Args:
-
-
-*  <b>`values`</b>: A list of `Tensor` objects with the same shape and type.
-*  <b>`axis`</b>: An `int`. The axis to stack along. Defaults to the first dimension.
-    Supports negative indexes.
-*  <b>`name`</b>: A name for this operation (optional).
-
-##### Returns:
-
-
-*  <b>`output`</b>: A stacked `Tensor` with the same type as `values`.
-
-##### Raises:
-
-
-*  <b>`ValueError`</b>: If `axis` is out of the range [-(R+1), R+1).
 
 
 - - -
@@ -706,6 +665,9 @@ Note that the rank of `input` must be known.
 
 Aliases for fully_connected which set a default activation function are
 available: `relu`, `relu6` and `linear`.
+
+`stack` operation is also available. It builds a stack of layers by applying
+a layer repeatedly.
 
 ## Regularizers
 
@@ -1227,7 +1189,7 @@ Creates a _CrossedColumn for performing feature crosses.
 
 - - -
 
-### `tf.contrib.layers.embedding_column(sparse_id_column, dimension, combiner=None, initializer=None, ckpt_to_load_from=None, tensor_name_in_ckpt=None)` {#embedding_column}
+### `tf.contrib.layers.embedding_column(sparse_id_column, dimension, combiner=None, initializer=None, ckpt_to_load_from=None, tensor_name_in_ckpt=None, max_norm=None)` {#embedding_column}
 
 Creates an `_EmbeddingColumn` for feeding sparse data into a DNN.
 
@@ -1255,6 +1217,8 @@ Creates an `_EmbeddingColumn` for feeding sparse data into a DNN.
 *  <b>`tensor_name_in_ckpt`</b>: (Optional). Name of the `Tensor` in the provided
     checkpoint from which to restore the column weights. Required if
     `ckpt_to_load_from` is not None.
+*  <b>`max_norm`</b>: (Optional). If not None, embedding values are l2-normalized to
+    the value of max_norm.
 
 ##### Returns:
 
@@ -1579,7 +1543,7 @@ Creates a `_RealValuedColumn` for dense numeric data.
 
 - - -
 
-### `tf.contrib.layers.shared_embedding_columns(sparse_id_columns, dimension, combiner=None, shared_embedding_name=None, initializer=None, ckpt_to_load_from=None, tensor_name_in_ckpt=None)` {#shared_embedding_columns}
+### `tf.contrib.layers.shared_embedding_columns(sparse_id_columns, dimension, combiner=None, shared_embedding_name=None, initializer=None, ckpt_to_load_from=None, tensor_name_in_ckpt=None, max_norm=None)` {#shared_embedding_columns}
 
 Creates a list of `_EmbeddingColumn` sharing the same embedding.
 
@@ -1610,6 +1574,8 @@ Creates a list of `_EmbeddingColumn` sharing the same embedding.
 *  <b>`tensor_name_in_ckpt`</b>: (Optional). Name of the `Tensor` in the provided
     checkpoint from which to restore the column weights. Required if
     `ckpt_to_load_from` is not None.
+*  <b>`max_norm`</b>: (Optional). If not None, embedding values are l2-normalized to
+    the value of max_norm.
 
 ##### Returns:
 
@@ -1748,7 +1714,7 @@ Example:
       is a SparseTensor.
    Following are assumed to be true:
      * sparse_tensor.indices = weights_tensor.indices
-     * sparse_tensor.shape = weights_tensor.shape
+     * sparse_tensor.dense_shape = weights_tensor.dense_shape
 
 ##### Args:
 

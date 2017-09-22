@@ -17,7 +17,7 @@ limitations under the License.
 #define THIRD_PARTY_TENSORFLOW_COMPILER_XLA_SERVICE_GPU_FUSION_MERGER_H_
 
 #include "tensorflow/compiler/xla/service/hlo_module.h"
-#include "tensorflow/compiler/xla/service/hlo_pass.h"
+#include "tensorflow/compiler/xla/service/hlo_pass_interface.h"
 
 namespace xla {
 namespace gpu {
@@ -25,16 +25,16 @@ namespace gpu {
 // An HLO pass that attempts to merge fusion instructions to reduce kernel
 // launch overhead and improve data locality.
 //
-// Fusion instructions are merged into their users if two conditons are met:
+// Fusion instructions are merged into their users if two conditions are met:
 //
 // 1) The flops_to_bytes ratio of the fusion instruction is below the threshold
 //    value of 1.0.
 // 2) The result of merging the fusion instruction into its users would not
 //    increase bytes transferred.
 //
-class FusionMerger : public HloPass {
+class FusionMerger : public HloPassInterface {
  public:
-  FusionMerger() : HloPass("fusion merger") {}
+  tensorflow::StringPiece name() const override { return "fusion merger"; }
 
   StatusOr<bool> Run(HloModule* module) override;
 

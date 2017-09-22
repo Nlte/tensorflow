@@ -16,7 +16,9 @@ limitations under the License.
 #include "tensorflow/compiler/xla/service/gpu/fusion_merger.h"
 
 #include <algorithm>
+#include <vector>
 
+#include "tensorflow/compiler/xla/service/gpu/instruction_fusion.h"
 #include "tensorflow/compiler/xla/service/hlo_cost_analysis.h"
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/util.h"
@@ -96,9 +98,16 @@ double CalculateFlopsToBytesRatio(HloInstruction* fusion) {
   // Calculate total bytes transferred in/out.
   double bytes = CalculateBytesReadByFusionInstruction(fusion);
   // Add bytes written to root instructions buffer.
-  bytes += ShapeUtil::ByteSizeOf(fusion->fused_expression_root()->shape());
-  // Calculate flops for all fused instructions.
-  HloCostAnalysis analysis;
+  if (fusion->IsMultiOutputFusion()) {
+    for (auto& operand : fusion->fused_expression_root()->operands()) {
+      bytes += ShapeUtil::ByteSizeOf(operand->shape());
+    }
+  } else {
+    bytes += ShapeUtil::ByteSizeOf(fusion->fused_expression_root()->shape());
+  }
+  // Calculate flops for all fused instructions. Use a null shape size function
+  // because we don't care about bytes accessed by the ops.
+  HloCostAnalysis analysis([](const Shape& shape) { return 0; });
   TF_CHECK_OK(fusion->fused_expression_root()->Accept(&analysis));
   // Return flops / bytes.
   return bytes > 0.0 ? analysis.flop_count() / bytes : analysis.flop_count();
@@ -109,8 +118,15 @@ double CalculateFlopsToBytesRatio(HloInstruction* fusion) {
 double GetCurrentBytesTransferred(HloInstruction* fusion) {
   CHECK_EQ(HloOpcode::kFusion, fusion->opcode());
   const double bytes_read = CalculateBytesReadByFusionInstruction(fusion);
-  const double bytes_written =
-      ShapeUtil::ByteSizeOf(fusion->fused_expression_root()->shape());
+  double bytes_written = 0;
+  if (fusion->IsMultiOutputFusion()) {
+    for (auto& operand : fusion->fused_expression_root()->operands()) {
+      bytes_written += ShapeUtil::ByteSizeOf(operand->shape());
+    }
+  } else {
+    bytes_written =
+        ShapeUtil::ByteSizeOf(fusion->fused_expression_root()->shape());
+  }
   // Current bytes transferred (ignoring non 'fusion' user operands) is bytes
   // read and written by 'fusion', plus reads of size 'bytes_written' for each
   // user.
@@ -149,6 +165,7 @@ class FusionInstructionMerger {
   int num_fail_no_users_ = 0;
   int num_fail_not_loop_fusion_ = 0;
   int num_fail_merge_all_users_ = 0;
+  int num_fail_expensive_fused_instruction_ = 0;
   int num_fail_flops_to_byte_ratio_ = 0;
   int num_fail_net_bytes_transferred_ratio_ = 0;
 
@@ -169,6 +186,7 @@ Status FusionInstructionMerger::Run() {
           << " no_users: " << num_fail_no_users_
           << " not_loop_fusion: " << num_fail_not_loop_fusion_
           << " merge_all_users: " << num_fail_merge_all_users_
+          << " expensive_instruction: " << num_fail_expensive_fused_instruction_
           << " flops_to_byte_ratio: " << num_fail_flops_to_byte_ratio_
           << " net_bytes_transferred: " << num_fail_net_bytes_transferred_ratio_
           << " }";
@@ -193,6 +211,12 @@ Status FusionInstructionMerger::HandleFusion(HloInstruction* fusion) {
     ++num_fail_not_loop_fusion_;
     return Status::OK();
   }
+
+  // Skip multiple output fusion. It's not yet supported.
+  if (fusion->IsMultiOutputFusion()) {
+    ++num_fail_not_loop_fusion_;
+    return Status::OK();
+  }
   // Skip 'fusion' instruction if we cannot merge into all of its users.
   // Merging into all users enables the removal of 'fusion' from the
   // computation.
@@ -205,6 +229,26 @@ Status FusionInstructionMerger::HandleFusion(HloInstruction* fusion) {
     ++num_fail_merge_all_users_;
     return Status::OK();
   }
+
+  // Skip 'fusion' instruction if any of its fused instructions are expensive.
+  // This is done to avoid the duplication of expensive instructions, which
+  // would occur if 'fusion' were merged into multiple users.
+  // If 'fusion' has just one user, then an earlier fusion pass chose not to
+  // fuse this producer/comsumer pair (likely because of expensive instruction
+  // re-use by the consumer), and so we honor that choice here as well.
+  if (!std::all_of(fusion->fused_instructions().begin(),
+                   fusion->fused_instructions().end(),
+                   [](const std::unique_ptr<HloInstruction>& instruction) {
+                     if (instruction->opcode() != HloOpcode::kParameter &&
+                         GpuInstructionFusion::IsExpensive(*instruction)) {
+                       return false;
+                     }
+                     return true;
+                   })) {
+    ++num_fail_expensive_fused_instruction_;
+    return Status::OK();
+  }
+
   // Skip 'fusion' instruction if its flops to bytes transferred ratio
   // exceeds the threshold value.
   if (CalculateFlopsToBytesRatio(fusion) >
@@ -225,7 +269,7 @@ Status FusionInstructionMerger::HandleFusion(HloInstruction* fusion) {
     return Status::OK();
   }
   // Merge fused instructions from 'fusion' into each user.
-  std::set<HloInstruction*> users = fusion->users();
+  std::vector<HloInstruction*> users = fusion->users();
   for (HloInstruction* user : users) {
     user->MergeFusionInstruction(fusion);
     changed_ = true;
@@ -243,19 +287,25 @@ Status FusionInstructionMerger::HandleFusion(HloInstruction* fusion) {
           << " }";
   // Remove 'fusion' instruction.
   CHECK_EQ(0, fusion->user_count());
-  computation_->RemoveInstruction(fusion);
-  return Status::OK();
+  return computation_->RemoveInstruction(fusion);
 }
 
 StatusOr<bool> FusionMerger::Run(HloModule* module) {
   bool changed = false;
   VLOG(2) << "FusionMerger for module: " << module->name();
+  std::vector<HloComputation*> computations;
   for (auto& computation : module->computations()) {
+    if (computation->IsFusionComputation()) {
+      continue;
+    }
+    computations.push_back(computation.get());
+  }
+  for (auto& computation : computations) {
     VLOG(1) << "Before running FusionInstructionMerger for computation: "
             << computation->name();
     XLA_VLOG_LINES(3, computation->ToString());
 
-    FusionInstructionMerger fusion_merger(computation.get());
+    FusionInstructionMerger fusion_merger(computation);
     TF_RETURN_IF_ERROR(fusion_merger.Run());
     changed |= fusion_merger.changed();
 

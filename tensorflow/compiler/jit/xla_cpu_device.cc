@@ -16,15 +16,14 @@ limitations under the License.
 // Registers the XLA_CPU device, which is an XlaDevice instantiation that runs
 // operators using XLA via the XLA "Host" (CPU) backend.
 
+#include "tensorflow/compiler/jit/kernels/xla_local_launch_op.h"
 #include "tensorflow/compiler/jit/xla_device.h"
 #include "tensorflow/compiler/jit/xla_device_ops.h"
-#include "tensorflow/compiler/tf2xla/xla_compilation_device.h"
+#include "tensorflow/compiler/tf2xla/xla_op_registry.h"
 #include "tensorflow/core/common_runtime/device_factory.h"
 #include "tensorflow/core/lib/core/status.h"
 
 namespace tensorflow {
-
-const char* const DEVICE_XLA_CPU = "XLA_CPU";
 
 class XlaCpuDeviceFactory : public DeviceFactory {
  public:
@@ -54,7 +53,7 @@ REGISTER_LOCAL_DEVICE_FACTORY(DEVICE_XLA_CPU, XlaCpuDeviceFactory);
 constexpr std::array<DataType, 5> kAllXlaCpuTypes = {
     {DT_INT32, DT_INT64, DT_FLOAT, DT_DOUBLE, DT_BOOL}};
 
-REGISTER_XLA_LAUNCH_KERNEL(DEVICE_XLA_CPU, XlaDeviceLaunchOp, kAllXlaCpuTypes);
+REGISTER_XLA_LAUNCH_KERNEL(DEVICE_XLA_CPU, XlaLocalLaunchOp, kAllXlaCpuTypes);
 REGISTER_XLA_DEVICE_KERNELS(DEVICE_XLA_CPU, kAllXlaCpuTypes);
 
 }  // namespace tensorflow

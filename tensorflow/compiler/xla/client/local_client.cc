@@ -17,10 +17,10 @@ limitations under the License.
 
 #include <utility>
 
-#include "external/llvm/include/llvm/ADT/Triple.h"
+#include "llvm/ADT/Triple.h"
 #include "tensorflow/compiler/xla/ptr_util.h"
 #include "tensorflow/compiler/xla/service/backend.h"
-#include "tensorflow/compiler/xla/service/llvm_ir/llvm_util.h"
+#include "tensorflow/compiler/xla/service/service_executable_run_options.h"
 #include "tensorflow/compiler/xla/status_macros.h"
 
 namespace se = ::perftools::gputools;
@@ -67,35 +67,13 @@ bool ExecutableBuildOptions::has_hybrid_result() const {
 }
 
 namespace {
-
-// Convenience class which holds an acquired stream from the backend and
-// automatically releases it when destructed.
-class StreamManager {
- public:
-  static StatusOr<std::unique_ptr<StreamManager>> AcquireStream(
-      Backend* backend, int device_ordinal) {
-    TF_ASSIGN_OR_RETURN(
-        se::StreamExecutor * executor,
-        backend->stream_executor(device_ordinal == -1
-                                     ? backend->default_device_ordinal()
-                                     : device_ordinal));
-    TF_ASSIGN_OR_RETURN(std::unique_ptr<se::Stream> stream,
-                        backend->AcquireStream(executor));
-    return WrapUnique(new StreamManager(backend, std::move(stream)));
+StatusOr<Backend::StreamPtr> BorrowStreamForDevice(int device_ordinal,
+                                                   Backend* backend) {
+  if (device_ordinal < 0) {
+    device_ordinal = backend->default_device_ordinal();
   }
-
-  ~StreamManager() { backend_->ReleaseStream(std::move(stream_)); }
-
-  se::Stream* stream() const { return stream_.get(); }
-
- private:
-  StreamManager(Backend* backend, std::unique_ptr<se::Stream> stream)
-      : backend_(backend), stream_(std::move(stream)) {}
-
-  Backend* backend_;
-  std::unique_ptr<se::Stream> stream_;
-};
-
+  return backend->BorrowStream(device_ordinal);
+}
 }  // namespace
 
 LocalExecutable::LocalExecutable(std::unique_ptr<Executable> executable,
@@ -108,7 +86,7 @@ LocalExecutable::LocalExecutable(std::unique_ptr<Executable> executable,
 
 tensorflow::Status LocalExecutable::ValidateExecutionOptions(
     const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
-    const ExecutableRunOptions& options) {
+    const ExecutableRunOptions& options, const Backend& backend) {
   const ComputationLayout& computation_layout =
       executable_->module_config().entry_computation_layout();
 
@@ -177,71 +155,54 @@ tensorflow::Status LocalExecutable::ValidateExecutionOptions(
         run_executor->GetDeviceDescription().name().c_str());
   }
 
-  return tensorflow::Status::OK();
+  if (!options.allocator()) {
+    return InvalidArgument("an allocator must be provided to ExecuteLocally");
+  }
+
+  if (options.allocator()->platform() != backend.platform()) {
+    return InvalidArgument(
+        "allocator platform (%s) does not match service platform (%s)",
+        options.allocator()->platform()->Name().c_str(),
+        backend.platform()->Name().c_str());
+  }
+
+  return Status::OK();
 }
 
 StatusOr<std::unique_ptr<ShapedBuffer>> LocalExecutable::Run(
     const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
     const ExecutableRunOptions& options) {
-  TF_RETURN_IF_ERROR(ValidateExecutionOptions(arguments, options));
+  TF_RETURN_IF_ERROR(ValidateExecutionOptions(arguments, options, *backend_));
 
   ExecutableRunOptions actual_options = options;
-  std::unique_ptr<StreamManager> acquired_stream;
   if (options.stream() == nullptr) {
     TF_ASSIGN_OR_RETURN(
-        acquired_stream,
-        StreamManager::AcquireStream(backend_, options.device_ordinal()));
-    actual_options.set_stream(acquired_stream->stream());
+        Backend::StreamPtr stream,
+        BorrowStreamForDevice(options.device_ordinal(), backend_));
+    actual_options.set_stream(stream.get());
   }
   if (options.allocator() == nullptr) {
     actual_options.set_allocator(backend_->memory_allocator());
   }
 
-  if (executable_->dumping()) {
-    return ExecuteAndDump(&actual_options, arguments);
-  }
-  return executable_->ExecuteOnStream(&actual_options, arguments,
-                                      /*hlo_execution_profile=*/nullptr);
-}
-
-tensorflow::Status LocalExecutable::Run(
-    const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
-    const ExecutableRunOptions& options, ShapedBuffer* result) {
-  const ComputationLayout& computation_layout =
-      executable_->module_config().entry_computation_layout();
-  TF_RETURN_IF_ERROR(ValidateExecutionOptions(arguments, options));
-
-  if (!computation_layout.result_layout().MatchesLayoutInShape(
-          result->shape())) {
-    return InvalidArgument(
-        "result buffer does not match shape or layout of computation result: "
-        "expected %s, got %s",
-        ShapeUtil::HumanString(computation_layout.result_layout().shape())
-            .c_str(),
-        ShapeUtil::HumanString(result->shape()).c_str());
-  }
-
-  ExecutableRunOptions actual_options = options;
-  std::unique_ptr<StreamManager> acquired_stream;
-  if (options.stream() == nullptr) {
-    TF_ASSIGN_OR_RETURN(
-        acquired_stream,
-        StreamManager::AcquireStream(backend_, options.device_ordinal()));
-    actual_options.set_stream(acquired_stream->stream());
-  }
-  if (options.allocator() == nullptr) {
-    actual_options.set_allocator(backend_->memory_allocator());
-  }
+  // For local client execution on CPU backends:
+  // *) The thread pool used for eigen CPU ops is from
+  //    ExecutableRunOptions.eigen_intra_op_thread_pool.
+  // *) The thread pool used for XLA CPU ops is from
+  //    backend_->eigen_intra_op_thread_pool().
+  ServiceExecutableRunOptions service_options(
+      actual_options, backend_->StreamBorrower(),
+      backend_->eigen_intra_op_thread_pool());
 
   if (executable_->dumping()) {
-    return Unimplemented("dumping execution not supported on this path");
+    return ExecuteAndDump(&service_options, arguments);
   }
-  return executable_->ExecuteOnStream(&actual_options, arguments, result,
-                                      /*hlo_execution_profile=*/nullptr);
+  return executable_->ExecuteOnStreamWrapper<std::unique_ptr<ShapedBuffer>>(
+      &service_options, options.execution_profile(), arguments);
 }
 
 StatusOr<std::unique_ptr<ShapedBuffer>> LocalExecutable::ExecuteAndDump(
-    const ExecutableRunOptions* run_options,
+    const ServiceExecutableRunOptions* run_options,
     const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments) {
   executable_->session_module()->set_execution_platform(
       backend_->platform()->Name());
@@ -260,18 +221,23 @@ tensorflow::Status LocalExecutable::RecordArguments(
     SessionModule* session_module) {
   session_module->clear_arguments();
   for (const ShapedBuffer* argument : arguments) {
-    TF_RETURN_IF_ERROR(
-        LiteralFromShapedBuffer(*argument, session_module->add_arguments()));
+    Literal literal;
+    TF_RETURN_IF_ERROR(LiteralFromShapedBuffer(*argument, &literal));
+    *session_module->add_arguments() = literal.ToProto();
   }
-  return tensorflow::Status::OK();
+  return Status::OK();
 }
 
 tensorflow::Status LocalExecutable::RecordResult(
     const ShapedBuffer* result, SessionModule* session_module) {
   session_module->clear_result();
-  return LiteralFromShapedBuffer(*result, session_module->mutable_result());
+  Literal literal(session_module->result());
+  TF_RETURN_IF_ERROR(LiteralFromShapedBuffer(*result, &literal));
+  *session_module->mutable_result() = literal.ToProto();
+  return Status::OK();
 }
 
+// TODO(dnovillo) Change signature to return StatusOr<Literal>.
 tensorflow::Status LocalExecutable::LiteralFromShapedBuffer(
     const ShapedBuffer& shaped_buffer, Literal* literal) {
   TF_ASSIGN_OR_RETURN(
@@ -280,70 +246,6 @@ tensorflow::Status LocalExecutable::LiteralFromShapedBuffer(
   return backend_->transfer_manager()->TransferLiteralFromDevice(
       executor, shaped_buffer.buffer({}), shaped_buffer.shape(),
       shaped_buffer.shape(), literal);
-}
-
-StatusOr<std::unique_ptr<GlobalData>> LocalClient::AllocateBufferOnDevice(
-    const Shape& shape, int device_ordinal, bool allocate_space_for_deep_copy) {
-  TF_ASSIGN_OR_RETURN(GlobalDataHandle handle,
-                      local_service_->AllocateBufferOnDevice(
-                          shape, device_ordinal, allocate_space_for_deep_copy));
-  return std::unique_ptr<GlobalData>(new GlobalData(local_service_, handle));
-}
-
-tensorflow::Status LocalClient::ResolveArguments(
-    const tensorflow::gtl::ArraySlice<const GlobalDataHandle*> arguments,
-    int device_ordinal,
-    std::vector<perftools::gputools::DeviceMemoryBase>* argument_ptrs) {
-  return local_service_->ResolveArguments(arguments, device_ordinal,
-                                          argument_ptrs);
-}
-
-StatusOr<std::unique_ptr<ShapedBuffer>> LocalClient::ExecuteLocally(
-    const Computation& computation,
-    const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
-    const LocalExecuteOptions& options) {
-  return local_service_->ExecuteLocally(computation.handle(), arguments,
-                                        options);
-}
-
-tensorflow::Status LocalClient::ExecuteLocally(
-    const Computation& computation,
-    const tensorflow::gtl::ArraySlice<const ShapedBuffer*> arguments,
-    const LocalExecuteOptions& options, ShapedBuffer* result) {
-  return local_service_->ExecuteLocally(computation.handle(), arguments,
-                                        options, result);
-}
-
-StatusOr<std::vector<std::unique_ptr<AotCompilationResult>>>
-LocalClient::CompileAheadOfTime(
-    const tensorflow::gtl::ArraySlice<AheadOfTimeComputationInstance>
-        computations,
-    const AotCompilationOptions& options) {
-  std::vector<LocalService::AheadOfTimeComputationInstance> service_instances;
-  service_instances.reserve(computations.size());
-  for (const AheadOfTimeComputationInstance& instance : computations) {
-    service_instances.push_back({});
-    LocalService::AheadOfTimeComputationInstance& service_instance =
-        service_instances.back();
-    TF_RET_CHECK(instance.computation != nullptr);
-    service_instance.computation = instance.computation->handle();
-    service_instance.argument_layouts = instance.argument_layouts;
-    service_instance.result_layout = instance.result_layout;
-  }
-  return local_service_->CompileAheadOfTime(service_instances, options);
-}
-
-int64 LocalClient::PointerSizeForTriple(tensorflow::StringPiece target_triple) {
-  llvm::Triple triple(
-      llvm::Triple::normalize(llvm_ir::AsStringRef(target_triple)));
-  if (triple.isArch64Bit()) {
-    return 8;
-  } else if (triple.isArch32Bit()) {
-    return 4;
-  } else {
-    CHECK(triple.isArch16Bit());
-    return 2;
-  }
 }
 
 se::Platform* LocalClient::platform() const {
@@ -362,6 +264,14 @@ int LocalClient::default_device_ordinal() const {
   return local_service_->backend().default_device_ordinal();
 }
 
+const Backend& LocalClient::backend() const {
+  return local_service_->backend();
+}
+
+Backend* LocalClient::mutable_backend() {
+  return local_service_->mutable_backend();
+}
+
 StatusOr<std::unique_ptr<LocalExecutable>> LocalClient::Compile(
     const Computation& computation,
     const tensorflow::gtl::ArraySlice<const Shape*> argument_layouts,
@@ -377,6 +287,58 @@ StatusOr<std::unique_ptr<LocalExecutable>> LocalClient::Compile(
   return WrapUnique(new LocalExecutable(std::move(executable),
                                         local_service_->mutable_backend(),
                                         device_ordinal, options));
+}
+
+// Copy the literal data to the device with the given ordinal and return as a
+// ScopedShapedBuffer. The given memory allocator is used for device memory
+// allocation.
+StatusOr<std::unique_ptr<ScopedShapedBuffer>>
+LocalClient::LiteralToShapedBuffer(const Literal& literal,
+                                   DeviceMemoryAllocator* allocator,
+                                   int device_ordinal) {
+  TF_ASSIGN_OR_RETURN(auto scoped_buffer,
+                      ScopedShapedBuffer::MakeScopedShapedBuffer(
+                          literal.shape(), allocator, device_ordinal));
+  TF_ASSIGN_OR_RETURN(se::StreamExecutor * executor,
+                      backend().stream_executor(device_ordinal));
+  TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+      literal.shape(), [&](const Shape& subshape, const ShapeIndex& index) {
+        if (ShapeUtil::IsArray(subshape)) {
+          // This is a leaf of the shape. Transfer the literal array data to the
+          // device buffer.
+          return backend().transfer_manager()->TransferLiteralToDevice(
+              executor, literal.GetSubliteral(index),
+              scoped_buffer->mutable_buffer(index));
+        }
+        return Status::OK();
+      }));
+  return std::move(scoped_buffer);
+}
+
+// Copy the data from the device contained in the given ShapedBuffer and
+// return as a Literal.
+StatusOr<std::unique_ptr<Literal>> LocalClient::ShapedBufferToLiteral(
+    const ShapedBuffer& shaped_buffer) {
+  std::unique_ptr<Literal> literal =
+      Literal::CreateFromShape(shaped_buffer.shape());
+  TF_ASSIGN_OR_RETURN(
+      se::StreamExecutor * executor,
+      backend().stream_executor(shaped_buffer.device_ordinal()));
+  TF_RETURN_IF_ERROR(ShapeUtil::ForEachSubshapeWithStatus(
+      literal->shape(), [&](const Shape& subshape, const ShapeIndex& index) {
+        if (ShapeUtil::IsArray(subshape)) {
+          // This is a leaf of the shape. Transfer the device buffer into the
+          // literal. The layout of the literal and the device buffer are
+          // necessarily the same so we pass 'subshape' for both device and
+          // literal shapes.
+          return backend().transfer_manager()->TransferLiteralFromDevice(
+              executor, shaped_buffer.buffer(index),
+              /*device_shape=*/subshape,
+              /*literal_shape*/ subshape, &literal->GetSubliteral(index));
+        }
+        return Status::OK();
+      }));
+  return std::move(literal);
 }
 
 }  // namespace xla

@@ -18,8 +18,10 @@ limitations under the License.
 #include <numeric>
 
 #include "tensorflow/compiler/tf2xla/dump_graph.h"
+#include "tensorflow/compiler/tf2xla/functionalize_control_flow.h"
 #include "tensorflow/compiler/tf2xla/shape_util.h"
 #include "tensorflow/compiler/tf2xla/type_util.h"
+#include "tensorflow/compiler/tf2xla/xla_compilation_device.h"
 #include "tensorflow/compiler/tf2xla/xla_context.h"
 #include "tensorflow/compiler/xla/client/client_library.h"
 #include "tensorflow/core/common_runtime/device.h"
@@ -27,6 +29,7 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/common_runtime/graph_optimizer.h"
 #include "tensorflow/core/framework/attr_value_util.h"
+#include "tensorflow/core/graph/algorithm.h"
 #include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/lib/hash/hash.h"
@@ -34,46 +37,20 @@ limitations under the License.
 #include "tensorflow/core/public/version.h"
 
 namespace tensorflow {
-
 namespace {
 
-bool HasRetval(const Graph& graph) {
-  for (const Node* n : graph.nodes()) {
-    if (n->type_string() == "_Retval") return true;
+// Checks that arguments `args` match types `types`.
+Status CheckSignature(const DataTypeVector& types,
+                      const std::vector<XlaCompiler::Argument>& args) {
+  if (args.size() != types.size()) {
+    return errors::Internal("Compilation arguments have ", args.size(),
+                            " elements while function has ", types.size());
   }
-  return false;
-}
-
-Status CheckSignature(const DataTypeVector& tf_types,
-                      const xla::Shape& xla_shape) {
-  if (xla::ShapeUtil::IsTuple(xla_shape)) {
-    if (xla::ShapeUtil::TupleElementCount(xla_shape) != tf_types.size()) {
-      return errors::Internal("XLA shape has ",
-                              xla::ShapeUtil::TupleElementCount(xla_shape),
-                              " elements while function has ", tf_types.size());
-    }
-    for (int i = 0; i < tf_types.size(); ++i) {
-      xla::PrimitiveType type;
-      TF_RETURN_IF_ERROR(DataTypeToPrimitiveType(tf_types[i], &type));
-      if (type !=
-          xla::ShapeUtil::GetTupleElementShape(xla_shape, i).element_type()) {
-        return errors::Internal(
-            "element ", i, " has XLA type ",
-            xla::ShapeUtil::GetTupleElementShape(xla_shape, i).element_type(),
-            " and TensorFlow type ", DataTypeString(tf_types[i]));
-      }
-    }
-  } else {
-    if (tf_types.size() != 1) {
-      return errors::Internal("Expected singleton type, got ", tf_types.size(),
-                              " types");
-    }
-    xla::PrimitiveType type;
-    TF_RETURN_IF_ERROR(DataTypeToPrimitiveType(tf_types[0], &type));
-    if (type != xla_shape.element_type()) {
-      return errors::Internal("singleton element has XLA type ",
-                              xla_shape.element_type(), " and TensorFlow type ",
-                              DataTypeString(tf_types[0]));
+  for (int i = 0; i < types.size(); ++i) {
+    if (types[i] != args[i].type && types[i] != DT_RESOURCE) {
+      return errors::Internal(
+          "Argument ", i, " has declared type ", DataTypeString(args[i].type),
+          " but function parameter has type ", DataTypeString(types[i]));
     }
   }
   return Status::OK();
@@ -81,154 +58,120 @@ Status CheckSignature(const DataTypeVector& tf_types,
 
 }  // namespace
 
-XlaCompiler::XlaCompiler(const XlaCompiler::Options& options)
-    : client_(options.client),
-      allow_cpu_custom_calls_(options.allow_cpu_custom_calls),
-      local_executable_has_hybrid_result_(
-          options.local_executable_has_hybrid_result),
+bool XlaCompiler::Argument::operator==(
+    const XlaCompiler::Argument& other) const {
+  if (std::tie(kind, resource_kind, type, name, tensor_array_size,
+               tensor_array_gradients) !=
+      std::tie(other.kind, other.resource_kind, other.type, other.name,
+               other.tensor_array_size, other.tensor_array_gradients)) {
+    return false;
+  }
+  if (!xla::ShapeUtil::Equal(shape, other.shape)) {
+    return false;
+  }
+  if (constant_value.shape() != other.constant_value.shape()) {
+    return false;
+  }
+  return constant_value.tensor_data() == other.constant_value.tensor_data();
+}
+
+XlaCompiler::XlaCompiler(XlaCompiler::Options options)
+    : options_(options),
+      initialization_status_(Status::OK()),
       next_step_id_(1),
-      device_(new XlaCompilationDevice(SessionOptions(), options.device_type)),
-      device_mgr_({device_}) {}
+      device_(
+          new XlaCompilationDevice(SessionOptions(), *options_.device_type)),
+      device_mgr_({device_}) {
+  // We no longer need the device_type.
+  options_.device_type = nullptr;
+
+  if (options_.populate_resource_manager) {
+    initialization_status_ =
+        (*options_.populate_resource_manager)(device_->resource_manager());
+  }
+
+  local_flib_def_.reset(new FunctionLibraryDefinition(OpRegistry::Global(),
+
+                                                      FunctionDefLibrary{}));
+  local_pflr_.reset(new ProcessFunctionLibraryRuntime(
+      &device_mgr_, Env::Default(), options.graph_def_version,
+      local_flib_def_.get(), OptimizerOptions(),
+      nullptr /* custom_kernel_creator */));
+  pflr_.reset(new ProcessFunctionLibraryRuntime(
+      &device_mgr_, Env::Default(), options.graph_def_version, options.flib_def,
+      OptimizerOptions(), nullptr /* custom_kernel_creator */));
+
+  local_flib_runtime_ = local_pflr_->GetFLR(device_->name());
+  flib_runtime_ = pflr_->GetFLR(device_->name());
+}
 
 XlaCompiler::~XlaCompiler() = default;
 
-int64 XlaCompiler::NextStepId() {
-  mutex_lock l(mu_);
-  return next_step_id_++;
+int64 XlaCompiler::NextStepId() { return next_step_id_++; }
+
+uint64 XlaCompiler::SignatureHash::operator()(
+    const std::pair<string, std::vector<Argument>>& signature) const {
+  return std::hash<string>()(signature.first);
+}
+
+static Status GetFunctionBody(const NameAttrList& function,
+                              FunctionLibraryRuntime* flib_runtime,
+                              const FunctionBody** fbody) {
+  FunctionLibraryRuntime::Handle handle;
+  TF_RETURN_IF_ERROR(flib_runtime->Instantiate(
+      function.name(), AttrSlice(&function.attr()), &handle));
+
+  *fbody = flib_runtime->GetFunctionBody(handle);
+  TF_RET_CHECK(*fbody);
+  return Status::OK();
 }
 
 Status XlaCompiler::CompileFunction(
-    FunctionLibraryRuntime* flr, const NameAttrList& function,
+    const XlaCompiler::CompileOptions& options, const NameAttrList& function,
     const std::vector<XlaCompiler::Argument>& args,
     XlaCompiler::CompilationResult* result) {
-  const string function_id = Canonicalize(function.name(), function.attr());
+  const string function_id =
+      Canonicalize(function.name(), AttrSlice(&function.attr()));
   VLOG(1) << "XlaCompiler::CompileFunction " << function_id;
 
-  FunctionLibraryRuntime::Handle handle;
-  TF_RETURN_IF_ERROR(
-      flr->Instantiate(function.name(), function.attr(), &handle));
-
-  const FunctionBody* fbody = flr->GetFunctionBody(handle);
-  CHECK(fbody);
-
-  return CompileFunctionBody(flr, *fbody, function_id, args,
-                             /*use_tuple_arg=*/false, result);
-}
-
-Status XlaCompiler::CompileSubComputation(FunctionLibraryRuntime* flr,
-                                          const NameAttrList& function,
-                                          const xla::Shape& input_shape,
-                                          const xla::Shape& output_shape,
-                                          xla::Computation* computation) {
-  const string function_id = Canonicalize(function.name(), function.attr());
-  VLOG(1) << "XlaCompiler::CompileSubComputation " << function_id;
-
-  FunctionLibraryRuntime::Handle handle;
-  TF_RETURN_IF_ERROR(
-      flr->Instantiate(function.name(), function.attr(), &handle));
-
-  const FunctionBody* fbody = flr->GetFunctionBody(handle);
-  CHECK(fbody);
-
-  TF_RETURN_IF_ERROR(CheckSignature(fbody->arg_types, input_shape));
-  TF_RETURN_IF_ERROR(CheckSignature(fbody->ret_types, output_shape));
-
-  const bool use_tuple_arg = xla::ShapeUtil::IsTuple(input_shape);
-
-  std::vector<XlaCompiler::Argument> args(fbody->arg_types.size());
-  if (use_tuple_arg) {
-    for (int i = 0; i < args.size(); ++i) {
-      xla::Shape xla_shape =
-          xla::ShapeUtil::GetTupleElementShape(input_shape, i);
-      args[i].type = fbody->arg_types[i];
-      args[i].shape = XLAShapeToTensorShape(xla_shape);
-      args[i].parameter = i;
-    }
-  } else {
-    args[0].type = fbody->arg_types[0];
-    args[0].shape = XLAShapeToTensorShape(input_shape);
-    args[0].parameter = 0;
-  }
-
-  CompilationResult result;
-  TF_RETURN_IF_ERROR(CompileFunctionBody(flr, *fbody, function_id, args,
-                                         use_tuple_arg, &result));
-
-  if (!xla::ShapeUtil::Compatible(result.xla_output_shape, output_shape)) {
-    return errors::Internal("output shape mismatch from compilation");
-  }
-  *computation = std::move(result.computation);
-
-  return Status::OK();
-}
-
-Status XlaCompiler::CompileFunctionBody(
-    FunctionLibraryRuntime* flr, const FunctionBody& fbody,
-    const string& function_id, const std::vector<XlaCompiler::Argument>& args,
-    bool use_tuple_arg, XlaCompiler::CompilationResult* result) {
-  VLOG(1) << "XlaCompiler::CompileFunctionBody " << function_id;
-
-  std::unique_ptr<Graph> graph(new Graph(flr->GetFunctionLibraryDefinition()));
-  CopyGraph(*fbody.graph, graph.get());
-
-  if (VLOG_IS_ON(1)) {
-    dump_graph::DumpGraphToFile(
-        strings::StrCat("xla_jit_raw_input_", function_id), *graph);
-  }
-
-  if (!HasRetval(*graph)) {
-    VLOG(1) << "Graph has no retvals. Skipping compilation.";
+  auto it = cache_.find({function_id, args});
+  if (it != cache_.end()) {
+    *result = it->second;
     return Status::OK();
   }
 
-  // Optimize the graph to before running throught the translator.
-  // TODO(pbar) The constant folder currently does not simplify int32 operations
-  // for devices other than CPU.
+  const FunctionBody* fbody;
+  if (!GetFunctionBody(function, local_flib_runtime_, &fbody).ok()) {
+    TF_RETURN_IF_ERROR(GetFunctionBody(function, flib_runtime_, &fbody));
+  }
+
+  TF_RETURN_IF_ERROR(CheckSignature(fbody->arg_types, args));
+
+  std::unique_ptr<Graph> graph(new Graph(options_.flib_def));
+  CopyGraph(*fbody->graph, graph.get());
+
+  if (VLOG_IS_ON(2)) {
+    VLOG(2) << "XlaCompiler::CompileFunction: "
+            << dump_graph::DumpGraphToFile(
+                   strings::StrCat("xla_compile_function_", function_id),
+                   *graph);
+  }
+
+  // Optimize the graph before running the compiler.
   OptimizerOptions opts;
+  opts.set_do_common_subexpression_elimination(true);
+  opts.set_do_function_inlining(true);
+  opts.set_do_constant_folding(true);
   GraphOptimizer optimizer(opts);
-  OptimizeGraph(flr, &graph);
-
-  if (VLOG_IS_ON(1)) {
-    dump_graph::DumpGraphToFile(
-        strings::StrCat("xla_jit_final_graph_", function_id), *graph);
-  }
+  optimizer.Optimize(flib_runtime_, flib_runtime_->env(),
+                     /*device=*/nullptr, &graph, /*shape_map=*/nullptr);
 
   VLOG(1) << "====================================================";
-  TF_RETURN_IF_ERROR(CompileGraph(function_id, std::move(graph), flr, args,
-                                  use_tuple_arg, result));
+  TF_RETURN_IF_ERROR(
+      CompileGraph(options, function_id, std::move(graph), args, result));
   VLOG(1) << "====================================================";
 
-  return Status::OK();
-}
-
-Status XlaCompiler::BuildExecutable(
-    const XlaCompiler::CompilationResult& result,
-    std::unique_ptr<xla::LocalExecutable>* executable) {
-  VLOG(2) << "Compiling to local executable";
-  xla::Shape opaque_shape = xla::ShapeUtil::MakeOpaqueShape();
-
-  std::vector<const xla::Shape*> argument_layouts(
-      result.xla_input_shapes.size());
-  for (int i = 0; i < result.xla_input_shapes.size(); ++i) {
-    argument_layouts[i] = &result.xla_input_shapes[i].second;
-  }
-  if (result.requires_runtime_context) {
-    // The final arg is the XlaLocalRuntimeContext*.
-    argument_layouts.push_back(&opaque_shape);
-  }
-  xla::LocalClient* local_client = static_cast<xla::LocalClient*>(client());
-  xla::ExecutableBuildOptions build_options;
-  build_options.set_device_ordinal(local_client->default_device_ordinal());
-  build_options.set_platform(local_client->platform());
-  build_options.set_result_layout(result.xla_output_shape);
-  build_options.set_has_hybrid_result(local_executable_has_hybrid_result_);
-
-  auto compile_result = local_client->Compile(result.computation,
-                                              argument_layouts, build_options);
-  if (!compile_result.ok()) {
-    return compile_result.status();
-  }
-  *executable = std::move(compile_result.ValueOrDie());
+  cache_[{function_id, args}] = *result;
   return Status::OK();
 }
 
@@ -267,24 +210,12 @@ Status ExecuteGraph(XlaContext* xla_context, std::unique_ptr<Graph> graph,
   std::unique_ptr<Executor> exec(exec_ptr);
   // At this point ownership of the graph has been transferred to exec.
 
-  auto runner = [](Executor::Args::Closure c) {
-    // TODO(misard) Temporarily just schedule c eagerly while we
-    // decide what to do about the fact that the ComputationBuilder is
-    // thread-compatible, but we don't really want Op writers to have
-    // to remember to acquire a lock around every call to
-    // ComputationBuilder. One possibility is to add the (generally
-    // useful) ability to run a single-threaded Executor based on an
-    // option in LocalExecutorParams. Another is to automagically
-    // acquire a lock around ComputationBuilder calls using some
-    // wrapper or RAII funny business.
-    c();
-  };
-
   // Run the graph symbolically, turning the graph into an XLA computation.
   Executor::Args exec_args;
   exec_args.step_id = step_id;
   exec_args.step_container = step_container.get();
-  exec_args.runner = runner;
+  // Run all compilation kernels on the main thread.
+  exec_args.runner = [](Executor::Args::Closure c) { c(); };
   TF_RETURN_WITH_CONTEXT_IF_ERROR(
       exec->Run(exec_args),
       "Conversion from TensorFlow graph to XLA computation failed.");
@@ -294,122 +225,331 @@ Status ExecuteGraph(XlaContext* xla_context, std::unique_ptr<Graph> graph,
   return cleanup_status;
 }
 
+// Builds XLA computations for each of the arguments to the computation.
+// `args` are the arguments to the computation.
+Status BuildArguments(const std::vector<XlaCompiler::Argument>& args,
+                      bool use_tuple_arg, xla::ComputationBuilder* builder,
+                      XlaContext* context,
+                      std::vector<XlaExpression>* arg_expressions,
+                      std::vector<int>* input_mapping,
+                      std::vector<xla::Shape>* input_shapes) {
+  arg_expressions->resize(args.size());
+
+  // Argument numbers of arguments and resources that are to be passed to the
+  // XLA computation as runtime parameters.
+  std::vector<int> parameters, resources;
+  parameters.reserve(args.size());
+  resources.reserve(args.size());
+
+  // Fills in constant arguments, and computes non-constant argument order.
+  for (std::vector<XlaCompiler::Argument>::size_type i = 0; i < args.size();
+       ++i) {
+    const XlaCompiler::Argument& arg = args[i];
+    XlaExpression& arg_expression = (*arg_expressions)[i];
+    switch (arg.kind) {
+      case XlaCompiler::Argument::kResource:
+        TF_RET_CHECK(arg.resource_kind != XlaResource::kInvalid);
+        // TODO(phawkins): this code assumes that resource arguments do not
+        // alias.
+        XlaResource* resource;
+        TF_RETURN_IF_ERROR(
+            context->CreateResource(arg.resource_kind, i, arg.name, arg.type,
+                                    xla::ComputationDataHandle(), &resource));
+        resource->tensor_array_size = arg.tensor_array_size;
+        arg_expression.set_resource(resource);
+        if (arg.initialized) {
+          resources.push_back(i);
+        }
+        break;
+      case XlaCompiler::Argument::kParameter:
+        parameters.push_back(i);
+        break;
+      case XlaCompiler::Argument::kConstant:
+        arg_expression.set_constant_value(arg.constant_value);
+        break;
+      case XlaCompiler::Argument::kInvalid:
+        return errors::Internal("Unreachable case in BuildArguments()");
+    }
+  }
+
+  // Append parameters containing variable values after the other runtime
+  // parameters.
+  parameters.insert(parameters.end(), resources.begin(), resources.end());
+  if (parameters.empty()) {
+    return Status::OK();
+  }
+
+  input_shapes->resize(parameters.size());
+  input_mapping->resize(parameters.size());
+  for (std::vector<int>::size_type i = 0; i < parameters.size(); ++i) {
+    const XlaCompiler::Argument& arg = args[parameters[i]];
+    // Computes the shapes of non-constant arguments.
+    (*input_shapes)[i] = arg.shape;
+    (*input_mapping)[i] = parameters[i];
+  }
+
+  // Build parameter handles for non-constant arguments.
+  std::vector<xla::ComputationDataHandle> arg_handles(parameters.size());
+  if (use_tuple_arg) {
+    xla::Shape tuple_shape = xla::ShapeUtil::MakeTupleShape(*input_shapes);
+    xla::ComputationDataHandle tuple =
+        builder->Parameter(0, tuple_shape, "arg_tuple");
+    for (std::vector<int>::size_type i = 0; i < parameters.size(); ++i) {
+      arg_handles[i] = builder->GetTupleElement(tuple, i);
+    }
+  } else {
+    for (std::vector<int>::size_type i = 0; i < parameters.size(); ++i) {
+      arg_handles[i] =
+          builder->Parameter(i, (*input_shapes)[i], strings::StrCat("arg", i));
+    }
+  }
+
+  // Fill in the handles in non-constant arguments.
+  VLOG(2) << "XLA computation inputs:";
+  for (std::vector<int>::size_type i = 0; i < parameters.size(); ++i) {
+    const XlaCompiler::Argument& arg = args[parameters[i]];
+    VLOG(2) << "  XLA arg " << i
+            << " shape: " << xla::ShapeUtil::HumanString((*input_shapes)[i])
+            << " name: " << arg.name << " TF arg " << parameters[i];
+    XlaExpression& arg_expression = (*arg_expressions)[parameters[i]];
+    switch (arg.kind) {
+      case XlaCompiler::Argument::kResource: {
+        TF_RET_CHECK(arg.initialized);
+        XlaResource* resource = arg_expression.resource();
+        TF_RETURN_IF_ERROR(resource->SetFromPack(arg.tensor_array_gradients,
+                                                 arg_handles[i], builder));
+        VLOG(2) << "    resource: num_gradients: "
+                << arg.tensor_array_gradients.size();
+        resource->initial_value = resource->value;
+        for (const auto& gradient : resource->tensor_array_gradients) {
+          gradient.second->initial_value = gradient.second->value;
+        }
+        break;
+      }
+      case XlaCompiler::Argument::kParameter:
+        arg_expression.set_handle(arg_handles[i]);
+        break;
+      case XlaCompiler::Argument::kConstant:
+      case XlaCompiler::Argument::kInvalid:
+        return errors::Internal("Unreachable case in BuildArguments()");
+    }
+  }
+
+  return Status::OK();
+}
+
+// Builds the XLA computation.
+//
+// `retvals` is the list of retvals produced by _Retval operators, in index
+// order. `variable_map` is a map from variable ID numbers to XlaOpContext
+// variable states, generated by the symbolic evaluation.
+// If `return_updated_values_for_all_resources` is true, all resources will be
+// included in `resource_updates`, regardless of whether their value changed.
+// Sets `*num_nonconst_outputs` to the number of outputs of the `computation`.
+// Sets `*resource_updates` to a description of resources whose values are
+// written by the computation; the variable writes are the last
+// `resource_updates.size()` return values from the computation. Each entry in
+// `resource_updates` is a (input_index, type) pair, where `input_index` is the
+// index of a resource variable argument to the computation, and `type` is the
+// type of the final output.
+Status BuildComputation(
+    const std::vector<XlaCompiler::Argument>& args,
+    const std::vector<XlaExpression>& retvals,
+    const std::vector<std::unique_ptr<XlaResource>>& resources,
+    bool return_updated_values_for_all_resources,
+    xla::ComputationBuilder* builder, xla::Computation* computation,
+    int* num_computation_outputs, int* num_nonconst_outputs,
+    std::vector<XlaCompiler::ResourceUpdate>* resource_updates) {
+  std::vector<xla::ComputationDataHandle> elems;
+  elems.reserve(retvals.size());
+  for (const XlaExpression& retval : retvals) {
+    if (!retval.has_constant_value()) {
+      elems.push_back(retval.handle());
+    }
+  }
+  *num_nonconst_outputs = elems.size();
+
+  // Add return values for resources whose values have changed.
+  std::vector<const XlaResource*> arg_resources;
+  arg_resources.reserve(resources.size());
+  for (const auto& resource : resources) {
+    if (resource->arg_num >= 0) {
+      arg_resources.push_back(resource.get());
+    }
+  }
+  std::sort(arg_resources.begin(), arg_resources.end(),
+            [](const XlaResource* a, const XlaResource* b) {
+              return a->arg_num < b->arg_num;
+            });
+
+  for (const XlaResource* resource : arg_resources) {
+    const XlaCompiler::Argument& arg = args[resource->arg_num];
+    bool modified =
+        resource->value.handle() != resource->initial_value.handle();
+    // TensorArray gradients were modified if their values changed or there are
+    // any newly created gradients.
+    for (const auto& grad : resource->tensor_array_gradients) {
+      modified =
+          modified ||
+          grad.second->value.handle() != grad.second->initial_value.handle() ||
+          arg.tensor_array_gradients.count(grad.first) == 0;
+    }
+    if (return_updated_values_for_all_resources || modified) {
+      resource_updates->emplace_back();
+      XlaCompiler::ResourceUpdate& update = resource_updates->back();
+      update.input_index = resource->arg_num;
+      update.type = resource->type;
+      update.modified = modified;
+      for (const auto& grad : resource->tensor_array_gradients) {
+        update.tensor_array_gradients_accessed.insert(grad.first);
+      }
+      xla::ComputationDataHandle handle;
+      TF_RETURN_IF_ERROR(resource->Pack(&handle, builder));
+      elems.push_back(handle);
+    }
+  }
+
+  *num_computation_outputs = elems.size();
+
+  // Builds the XLA computation.
+  builder->Tuple(elems);
+  xla::StatusOr<xla::Computation> computation_status = builder->Build();
+  if (!computation_status.ok()) {
+    return computation_status.status();
+  }
+  *computation = computation_status.ConsumeValueOrDie();
+  return Status::OK();
+}
+
+void AssignMajorToMinorLayout(xla::Shape* shape) {
+  if (xla::ShapeUtil::IsTuple(*shape)) {
+    for (xla::Shape& elem_shape : *shape->mutable_tuple_shapes()) {
+      AssignMajorToMinorLayout(&elem_shape);
+    }
+  } else {
+    auto& minor_to_major = *shape->mutable_layout()->mutable_minor_to_major();
+    minor_to_major.Resize(xla::ShapeUtil::Rank(*shape), 0);
+    std::iota(minor_to_major.rbegin(), minor_to_major.rend(), 0);
+  }
+}
+
 }  // namespace
 
-Status XlaCompiler::CompileGraph(string const& name,
+Status XlaCompiler::CompileGraph(const XlaCompiler::CompileOptions& options,
+                                 string const& name,
                                  std::unique_ptr<Graph> graph,
-                                 FunctionLibraryRuntime* flib,
                                  const std::vector<XlaCompiler::Argument>& args,
-                                 bool use_tuple_arg,
                                  CompilationResult* result) {
   VLOG(1) << "Executing graph symbolically to populate ComputationBuilder.";
 
-  // Converts the input shapes into xla::Shape instances.
-  result->xla_input_shapes.reserve(args.size());
-  for (int i = 0; i < args.size(); ++i) {
-    if (args[i].parameter < 0) {
-      continue;
-    }
-    result->xla_input_shapes.push_back(std::make_pair(i, xla::Shape()));
-    TF_RETURN_IF_ERROR(TensorShapeToXLAShape(
-        args[i].type, args[i].shape, &result->xla_input_shapes.back().second));
+  if (VLOG_IS_ON(2)) {
+    VLOG(2) << "XlaCompiler::CompileGraph: "
+            << dump_graph::DumpGraphToFile(
+                   strings::StrCat("xla_compile_graph_", name), *graph);
   }
 
-  XlaContext* xla_context =
-      new XlaContext(this, client(), name, allow_cpu_custom_calls_);
-  core::ScopedUnref xla_context_unref(xla_context);
+  // Report the error here if initialization failed.
+  TF_RETURN_IF_ERROR(initialization_status_);
 
-  TF_RETURN_IF_ERROR(xla_context->BuildArguments(args, use_tuple_arg));
-
+  // Converts Tensorflow's graph control-flow constructs into functional
+  // control-flow that can be compiled into XLA code.
   TF_RETURN_IF_ERROR(
-      ExecuteGraph(xla_context, std::move(graph), device_, flib, NextStepId()));
+      FunctionalizeControlFlow(graph.get(), local_flib_def_.get()));
 
-  std::vector<XlaContext::ConstRetVal> compile_time_constants;
+  xla::ComputationBuilder builder(client(), name);
+  XlaContext* context =
+      new XlaContext(this, &builder, options_.allow_cpu_custom_calls,
+                     options.resolve_compile_time_constants);
+  core::ScopedUnref context_unref(context);
+
+  result->tuple_arg = options.use_tuple_arg;
+
+  std::vector<XlaExpression> arg_expressions;
+  TF_RETURN_IF_ERROR(BuildArguments(
+      args, options.use_tuple_arg, &builder, context, &arg_expressions,
+      &result->input_mapping, &result->xla_input_shapes));
+  context->set_args(std::move(arg_expressions));
+
+  TF_RETURN_IF_ERROR(ExecuteGraph(context, std::move(graph), device_,
+                                  flib_runtime_, NextStepId()));
+
   int num_nonconst_outputs;
-  TF_RETURN_IF_ERROR(xla_context->CollectResults(
-      &result->computation, &result->requires_runtime_context,
-      &compile_time_constants, &num_nonconst_outputs));
+  int num_computation_outputs;
+  result->computation = std::make_shared<xla::Computation>();
+  TF_RETURN_IF_ERROR(BuildComputation(
+      args, context->retvals(), context->resources(),
+      options.return_updated_values_for_all_resources, &builder,
+      result->computation.get(), &num_computation_outputs,
+      &num_nonconst_outputs, &result->resource_updates));
 
-  VLOG(2) << "Outputs: constant: " << compile_time_constants.size()
+  result->requires_runtime_context = context->has_context_parameter();
+
+  // Tuple arguments and runtime context parameters are incompatible.
+  CHECK(!(options.use_tuple_arg && result->requires_runtime_context));
+
+  VLOG(2) << "Outputs: total: " << context->retvals().size()
           << " nonconstant: " << num_nonconst_outputs;
-  result->outputs.resize(compile_time_constants.size() + num_nonconst_outputs);
-  for (const auto& c : compile_time_constants) {
-    if (!c.status.ok()) {
-      Status constant_status = c.status;
-      errors::AppendToMessage(&constant_status,
-                              "Failed evaluating constant XLA return "
-                              "value ",
-                              c.index);
-      return constant_status;
+  result->outputs.resize(context->retvals().size());
+  for (std::vector<XlaExpression>::size_type i = 0;
+       i < context->retvals().size(); ++i) {
+    const XlaExpression& retval = context->retvals()[i];
+    if (retval.has_constant_value()) {
+      OutputDescription& output = result->outputs[i];
+      output.shape = retval.constant_value().shape();
+      output.is_constant = true;
+      output.constant_value = retval.constant_value();
     }
-    if (c.index >= result->outputs.size()) {
-      return errors::InvalidArgument("Invalid argument index ", c.index);
-    }
-    OutputDescription& output = result->outputs[c.index];
-    output.shape = c.value.shape();
-    output.is_constant = true;
-    output.constant_value = c.value;
-  }
-
-  if (result->computation.IsNull()) {
-    return Status::OK();
   }
 
   // Compute the output shapes, if there is a computation with non-constant
   // outputs.
-  auto computation_shape = client()->GetComputationShape(result->computation);
+  auto computation_shape = client()->GetComputationShape(*result->computation);
   if (!computation_shape.ok()) {
     return computation_shape.status();
   }
 
   result->xla_output_shape.Swap(
       computation_shape.ValueOrDie()->mutable_result());
+  VLOG(2) << "XLA output shape: "
+          << xla::ShapeUtil::HumanString(result->xla_output_shape);
 
-  auto num_non_constant_outputs =
-      (xla::ShapeUtil::IsTuple(result->xla_output_shape))
-          ? xla::ShapeUtil::TupleElementCount(result->xla_output_shape)
-          : 1;
   // Tensorflow expects a major-to-minor order of results.
-  if (1 == num_non_constant_outputs) {
-    xla::Shape& s = result->xla_output_shape;
-    auto& minor_to_major = *s.mutable_layout()->mutable_minor_to_major();
-    minor_to_major.Resize(xla::ShapeUtil::Rank(s), 0);
-    std::iota(minor_to_major.rbegin(), minor_to_major.rend(), 0);
-  } else {
-    for (xla::Shape& s : *result->xla_output_shape.mutable_tuple_shapes()) {
-      auto& minor_to_major = *s.mutable_layout()->mutable_minor_to_major();
-      minor_to_major.Resize(xla::ShapeUtil::Rank(s), 0);
-      std::iota(minor_to_major.rbegin(), minor_to_major.rend(), 0);
-    }
-  }
+  AssignMajorToMinorLayout(&result->xla_output_shape);
 
   // Converts the output shapes to TensorShapes.
   int computation_output = 0;
-  for (int i = 0; i < result->outputs.size(); ++i) {
-    if (!result->outputs[i].is_constant) {
-      CHECK_LT(computation_output, num_non_constant_outputs);
-      if (num_non_constant_outputs > 1) {
-        result->outputs[i].shape =
-            XLAShapeToTensorShape(xla::ShapeUtil::GetTupleElementShape(
-                result->xla_output_shape, computation_output));
-      } else {
-        result->outputs[i].shape =
-            XLAShapeToTensorShape(result->xla_output_shape);
-      }
+  for (std::vector<XlaExpression>::size_type i = 0;
+       i < context->retvals().size(); ++i) {
+    const XlaExpression& retval = context->retvals()[i];
+    if (!retval.has_constant_value()) {
+      CHECK_LT(computation_output, num_computation_outputs);
+      OutputDescription& output = result->outputs[i];
+      output.is_constant = false;
+      TF_RETURN_IF_ERROR(XLAShapeToTensorShape(
+          xla::ShapeUtil::GetTupleElementShape(result->xla_output_shape,
+                                               computation_output),
+          &output.shape));
       ++computation_output;
     }
+  }
+
+  for (std::vector<ResourceUpdate>::size_type i = 0;
+       i < result->resource_updates.size(); ++i) {
+    result->resource_updates[i].shape = xla::ShapeUtil::GetTupleElementShape(
+        result->xla_output_shape, computation_output);
+    ++computation_output;
   }
   return Status::OK();
 }
 
 Status XlaCompiler::GetChannelHandle(const string& key,
                                      xla::ChannelHandle* channel) {
-  mutex_lock lock(mu_);
   auto result = channels_.emplace(key, xla::ChannelHandle());
   if (result.second) {
-    TF_ASSIGN_OR_RETURN(result.first->second, client_->CreateChannelHandle());
+    TF_ASSIGN_OR_RETURN(result.first->second, client()->CreateChannelHandle());
   }
   *channel = result.first->second;
+  VLOG(1) << "Channel: " << key << " " << channel->DebugString();
   return Status::OK();
 }
 

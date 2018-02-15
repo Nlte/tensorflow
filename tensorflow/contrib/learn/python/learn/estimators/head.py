@@ -33,7 +33,6 @@ from tensorflow.python.framework import ops
 from tensorflow.python.framework import sparse_tensor
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
-from tensorflow.python.ops import logging_ops
 from tensorflow.python.ops import lookup_ops
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import metrics as metrics_lib
@@ -120,7 +119,7 @@ class Head(object):
       update_op = tf.contrib.layers.optimize_loss(optimizer=sync,
                                                   loss=model_fn_ops.loss, ...)
       hooks = [sync.make_session_run_hook(is_chief)]
-      ... upate train_op and hooks in ModelFnOps and return
+      ... update train_op and hooks in ModelFnOps and return
     ```
   """
   __metaclass__ = abc.ABCMeta
@@ -182,7 +181,8 @@ def regression_head(label_name=None,
                     weight_column_name=None,
                     label_dimension=1,
                     enable_centered_bias=False,
-                    head_name=None):
+                    head_name=None,
+                    link_fn=None):
   """Creates a `Head` for linear regression.
 
   Args:
@@ -200,6 +200,8 @@ def regression_head(label_name=None,
     head_name: name of the head. If provided, predictions, summary and metrics
       keys will be suffixed by `"/" + head_name` and the default variable scope
       will be `head_name`.
+    link_fn: link function to convert logits to predictions. If provided,
+      this link function will be used instead of identity.
 
   Returns:
     An instance of `Head` for linear regression.
@@ -211,7 +213,7 @@ def regression_head(label_name=None,
       enable_centered_bias=enable_centered_bias,
       head_name=head_name,
       loss_fn=_mean_squared_loss,
-      link_fn=array_ops.identity)
+      link_fn=(link_fn if link_fn is not None else array_ops.identity))
 
 
 def poisson_regression_head(label_name=None,
@@ -635,10 +637,11 @@ def _create_model_fn_ops(features,
   if (mode != model_fn.ModeKeys.INFER) and (labels is not None):
     weight_tensor = _weight_tensor(features, weight_column_name)
     loss, weighted_average_loss = loss_fn(labels, logits, weight_tensor)
-    # Uses the deprecated API to set the tag explicitly.
-    # Without it, training and eval losses will show up in different graphs.
-    logging_ops.scalar_summary(
-        _summary_key(head_name, mkey.LOSS), weighted_average_loss)
+    # The name_scope escapism is needed to maintain the same summary tag
+    # after switching away from the now unsupported API.
+    with ops.name_scope(""):
+      summary_loss = array_ops.identity(weighted_average_loss)
+      summary.scalar(_summary_key(head_name, mkey.LOSS), summary_loss)
 
     if mode == model_fn.ModeKeys.TRAIN:
       if train_op_fn is None:
@@ -1484,8 +1487,12 @@ class _LossOnlyHead(Head):
         loss = self._loss_fn()
         if isinstance(loss, list):
           loss = math_ops.add_n(loss)
-        logging_ops.scalar_summary(
-            _summary_key(self.head_name, mkey.LOSS), loss)
+        # The name_scope escapism is needed to maintain the same summary tag
+        # after switching away from the now unsupported API.
+        with ops.name_scope(""):
+          summary_loss = array_ops.identity(loss)
+          summary.scalar(_summary_key(self.head_name, mkey.LOSS),
+                         summary_loss)
         if mode == model_fn.ModeKeys.TRAIN:
           if train_op_fn is None:
             raise ValueError("train_op_fn can not be None in TRAIN mode")
@@ -2029,13 +2036,13 @@ def _streaming_accuracy_at_threshold(predictions, labels, weights, threshold):
 
 def _streaming_precision_at_threshold(predictions, labels, weights, threshold):
   precision_tensor, update_op = metrics_lib.precision_at_thresholds(
-      labels, predictions, (threshold,),_float_weights_or_none(weights))
+      labels, predictions, (threshold,), _float_weights_or_none(weights))
   return array_ops.squeeze(precision_tensor), array_ops.squeeze(update_op)
 
 
 def _streaming_recall_at_threshold(predictions, labels, weights, threshold):
   precision_tensor, update_op = metrics_lib.recall_at_thresholds(
-      labels, predictions, (threshold,),_float_weights_or_none(weights))
+      labels, predictions, (threshold,), _float_weights_or_none(weights))
   return array_ops.squeeze(precision_tensor), array_ops.squeeze(update_op)
 
 
